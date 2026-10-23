@@ -1,0 +1,44 @@
+#ifndef __PLUGIN_NATIVE_NPU_INTERFACE_ENVVARIABLES__
+#define __PLUGIN_NATIVE_NPU_INTERFACE_ENVVARIABLES__
+
+#include "torch_npu/csrc/core/npu/NPUMacros.h"
+
+namespace at_npu {
+namespace native {
+namespace env {
+
+/**
+  check if the autotuen is enabled, return true or false.
+  */
+bool AutoTuneEnabled();
+bool CheckBmmV2Enable();
+bool CheckJitDisable();
+bool CheckProfilingEnable();
+TORCH_NPU_API bool CheckOpHookEnable();
+bool CheckMmBmmNDDisable();
+bool CheckForbidInternalFormat();
+bool CheckStrongConsistency();
+
+/**
+ Compatible configuration key.
+ */
+enum class CompatibleKey {
+    Randomness,
+};
+
+/**
+ check if the compatible impl is enabled, return true or false.
+ */
+bool CheckCompatibleImpl();
+bool CheckCompatibleImplFor(CompatibleKey compatible_key);
+bool CheckCompatibleImplBlackListFor(CompatibleKey compatible_key);
+
+bool IsAllowFP32ToFP16();
+bool IsAllowConvHF32();
+bool IsAllowMatmulHF32();
+
+} // namespace env
+} // namespace native
+} // namespace at_npu
+
+#endif // __NATIVE_NPU_INTERFACE_ENVVARIABLES__

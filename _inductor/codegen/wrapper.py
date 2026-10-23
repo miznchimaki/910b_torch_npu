@@ -1,0 +1,372 @@
+import os
+import copy
+from typing import Any, Callable, Optional, TYPE_CHECKING, Union
+import hashlib
+
+import torch
+from torch._inductor import config
+from torch._inductor.codegen.common import IndentedBuffer
+from torch._inductor.codegen.wrapper import PythonWrapperCodegen, SymbolicCallArg, SubgraphPythonWrapperCodegen
+from torch._inductor.runtime import triton_heuristics
+from torch._inductor.utils import (
+    cache_on_self,
+    is_codegen_graph_partition_subgraph,
+)
+from torch._inductor.virtualized import V
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+from torch.utils._sympy.singleton_int import SingletonInt
+from torch._inductor.ir import GraphPartitionSignature
+
+from torch_npu._inductor import config as npu_config
+import torch_npu.npu.aclnn
+from torch_npu._inductor._aclgraph_update_plan import (
+    append_inductor_aclgraph_update_plan_for_codegen_node,
+    emit_inductor_aclgraph_update_plan_for_wrapper,
+)
+
+
+def _is_codegen_graph_partition_subgraph(wrapper) -> bool:
+    try:
+        from torch._inductor.utils import is_codegen_graph_partition_subgraph
+    except ImportError:
+        return isinstance(wrapper, SubgraphPythonWrapperCodegen)
+    try:
+        return is_codegen_graph_partition_subgraph(wrapper)
+    except AttributeError:
+        return isinstance(wrapper, SubgraphPythonWrapperCodegen)
+from torch_npu._inductor.codegen.triton import NPUIndexTritonKernel
+from torch_npu._inductor.npu_triton_heuristics import PrecomputedGridNpu, user_autotune_npu
+
+
+class _NPUKernelCodegenMixin:
+    """
+    NPU-specific cross-cutting overrides that both the main wrapper and the
+    partition subgraph wrapper must apply. The mixin is not meant to be
+    instantiated on its own; it is mixed into NPUWrapperCodeGen and
+    NPUSubgraphWrapperCodegen as a base class.
+
+    Via cooperative multiple inheritance (super()), a single implementation
+    works for both the main graph wrapper and the subgraph wrapper. This
+    avoids code duplication and prevents main-wrapper-only logic
+    (AOT debug / aclnn initialization / whole-graph benchmark harness, etc.)
+    from leaking into subgraphs.
+    """
+
+
+    # generate numel expr for range_tree_node
+    def generate_node_numel_expr(self, kernel_name: str, node, numel_expr):
+        expr = f"{kernel_name}_{node.name}_numel"
+        if (expr, V.graph) not in self.kernel_numel_expr:
+            # declare expr once in each graph (scope)
+            self.kernel_numel_expr.add((expr, V.graph))
+            self.writeline(
+                f"{self.declare}{expr} = {self.expr_printer(numel_expr)}{self.ending}"
+            )
+        else:
+            self.writeline(f"{expr} = {self.expr_printer(numel_expr)}{self.ending}")
+        # We can get symbolic expressions here, like s0*64
+        # It is fine to have them here, but we need to handle them correctly as their own type
+        # This is tricky to do, so we wrap in a custom type, distinct from scalars, but also from sympy*
+        # scalars as well.
+        # This is handled in `generate_args_decl` which has a correct comment of: TODO: only works for
+        # constant now, need type info. I agree, this needs type info, and while this is not true type info
+        # it suffices as a type hint for the purposes of producing the correct code for this type.
+        return SymbolicCallArg(expr, numel_expr)
+
+    # don't assert
+    def codegen_input_size_asserts(self) -> None:
+        pass
+
+    def get_next_kernel_suffix(self) -> str:
+        iter_val = copy.copy(self._names_iter)
+        return f"{next(iter_val)}"
+
+    def define_kernel(
+        self,
+        kernel_name: str,
+        kernel_body: str,
+        metadata: Optional[str] = None,
+        gpu: bool = True,
+        cpp_definition: Optional[str] = None,
+    ):
+        # Override the parent logic: replace triton_heuristics.user_autotune with
+        # npu_triton_heuristics.user_autotune_npu, and replace PrecomputedGrid with
+        # PrecomputedGridNpu, to adapt to the NPU device and avoid core dump errors.
+        if "user_autotune" in kernel_body and "user_autotune_npu" not in kernel_body:
+            kernel_body = kernel_body.replace(
+                "triton_heuristics.user_autotune(",
+                "npu_triton_heuristics.user_autotune_npu("
+            )
+            kernel_body = kernel_body.replace(
+                "PrecomputedGrid",
+                "PrecomputedGridNpu"
+            )
+            kernel_body = kernel_body.replace(
+                "FixedGrid",
+                "FixedGridNpu"
+            )
+            # import headers related to npu_triton_heuristics
+            kernel_body = kernel_body.replace(
+                "'''\n",
+                "'''\n" + NPUIndexTritonKernel.gen_triton_ext_imports() + "\n"
+            )
+        super().define_kernel(kernel_name, kernel_body, metadata, gpu, cpp_definition)
+
+
+    def generate_fallback_kernel(self, node) -> None:
+        append_inductor_aclgraph_update_plan_for_codegen_node(self, node)
+        super().generate_fallback_kernel(node)
+
+    def generate_extern_kernel_alloc(self, extern_kernel):
+        append_inductor_aclgraph_update_plan_for_codegen_node(self, extern_kernel)
+        super().generate_extern_kernel_alloc(extern_kernel)
+
+    def generate_after_suffix(self, result: IndentedBuffer) -> None:
+        super().generate_after_suffix(result)
+        emit_inductor_aclgraph_update_plan_for_wrapper(
+            self,
+            result,
+            _is_codegen_graph_partition_subgraph(self),
+        )
+
+
+class NPUWrapperCodeGen(_NPUKernelCodegenMixin, PythonWrapperCodegen):
+    def __init__(self):
+        super().__init__()
+
+    @staticmethod
+    def create(
+        is_subgraph: bool,
+        subgraph_name: str,
+        parent_wrapper: PythonWrapperCodegen,
+        partition_signatures: Optional[GraphPartitionSignature] = None,
+    ):
+        if is_subgraph:
+            return NPUSubgraphWrapperCodegen(subgraph_name, parent_wrapper, partition_signatures)
+        return NPUWrapperCodeGen()
+
+    def write_header(self) -> None:
+        super().write_header()
+        self.imports.splice(
+            f"""
+                import torch_npu
+            """,
+            strip=True,
+        )
+
+    @cache_on_self
+    def write_triton_header_once(self) -> None:
+        import_str = f"""
+            import triton
+            import triton.language as tl
+            from {triton_heuristics.__name__} import start_graph, end_graph
+            import torch_npu
+            has_initialized = False
+            """
+        if config.triton.autotune_at_compile_time:
+            self.kernel_autotune_calls.splice(import_str)
+            self.kernel_autotune_calls.writeline(
+                V.graph.device_ops.import_get_raw_stream_as("get_raw_stream")
+            )
+        if not V.graph.cpp_wrapper:
+            self.imports.splice(import_str, strip=True)
+            self.imports.writeline(
+                V.graph.device_ops.import_get_raw_stream_as("get_raw_stream")
+            )
+
+    def add_benchmark_harness(self, output):
+        """
+        Override, add aot-inductor debug kernel support.
+        """
+        if not config.benchmark_harness:
+            return None
+
+        if npu_config.aot_inductor.debug_kernel:
+            return self.add_npu_repro(output)
+
+        return super().add_benchmark_harness(output)
+
+    def add_npu_repro(self, output):
+        self.add_repro_func(output)
+        self.add_benchmark_func(output)
+
+        output.writelines(["", "", 'if __name__ == "__main__":'])
+        with output.indent():
+            # List how to use. Read details in torch_npu/_inductor/config.py.
+            output.writelines(
+                [
+                    "# torch_npu._inductor.config.force_fallback_kernel_id = 'all'",
+                    "# or",
+                    "# torch_npu._inductor.config.force_fallback_kernel_id = [1, 2, 10]",
+                    "torch_npu._inductor.config.aot_inductor.debug_kernel_in_run = True",
+                    "result = benchmark_compiled_module()",
+                    "print(result)",
+                ]
+            )
+
+    def add_repro_func(self, output):
+        seen_constants = set()
+
+        def add_fake_input(name, shape, stride, device, dtype):
+            output.writeline(
+                f"{name} = rand_strided("
+                f"{self.codegen_python_shape_tuple(shape)}, "
+                f"{self.codegen_python_shape_tuple(stride)}, "
+                f"device='{device}', dtype={dtype})"
+            )
+
+        def get_hash(name):
+            byte = name.encode('utf-8')
+            sha1 = hashlib.sha1()
+            sha1.update(byte)
+            return sha1.hexdigest()
+
+        def save_tensor(tensor, path):
+            dirname = os.path.dirname(path)
+            if not os.path.exists(dirname):
+                os.makedirs(dirname)
+            torch.save(tensor, path)
+
+        def add_real_tensor(name, tensor):
+            tensor_dir = npu_config.aot_inductor.repro_tensor_path
+            if isinstance(tensor, FakeTensor):
+                raise RuntimeError(f"Could not generate repro func because detected {name} is FakeTensor "
+                                   f"when trying to dump it. Set repro and debug_kernel false to avoid it.")
+            hash_name = get_hash(name)
+            tensor_path = os.path.join(os.getcwd(), tensor_dir, f"{hash_name}.pt")
+            if name not in seen_constants:
+                save_tensor(tensor, tensor_path)
+                seen_constants.add(name)
+            output.writeline(
+                f"{name} = torch.load('{tensor_path}')"
+            )
+
+        def add_torchbind_input(name, value):
+            import pickle
+
+            output.writeline(f"{name} = pickle.loads({pickle.dumps(value)!r})")
+        output.writelines(
+            ["", "", f"def repro_run({', '.join(V.graph.graph_inputs.keys())}):"]
+        )
+        with output.indent():
+            output.splice(
+                """
+                from torch._dynamo.testing import rand_strided
+                from torch._inductor.utils import print_performance
+                """,
+                strip=True,
+            )
+            for name, value in V.graph.constants.items():
+                # all the constants are global variables, that's why we need
+                # these 'global var_name' lines
+                output.writeline(f"global {name}")
+                add_real_tensor(name, value)
+
+            if len(V.graph.torchbind_constants) > 0:
+                output.writeline("import pickle")
+                for name, torchbind_obj in V.graph.torchbind_constants.items():
+                    # all the constants are global variables, that's why we need
+                    # these 'global var_name' lines
+                    output.writeline(f"global {name}")
+                    add_torchbind_input(name, torchbind_obj)
+
+            call_str = f"call([{', '.join(V.graph.graph_inputs.keys())}])"
+            output.writeline(f"fn = lambda: {call_str}")
+            output.writeline("return fn()")
+
+    def add_benchmark_func(self, output):
+        def add_fake_input(name, shape, stride, device, dtype):
+            output.writeline(
+                f"{name} = rand_strided("
+                f"{self.codegen_python_shape_tuple(shape)}, "
+                f"{self.codegen_python_shape_tuple(stride)}, "
+                f"device='{device}', dtype={dtype})"
+            )
+
+        def add_expr_input(name, val):
+            output.writeline(f"{name} = {val}")
+
+        output.writelines(
+            ["", "", "def benchmark_compiled_module(times=10, repeat=10):"]
+        )
+        with output.indent():
+            output.splice(
+                """
+                from torch._dynamo.testing import rand_strided
+                from torch._inductor.utils import print_performance
+                """,
+                strip=True,
+            )
+            for name, value in V.graph.graph_inputs.items():
+                if isinstance(value, sympy.Symbol) and isinstance(
+                    V.graph.sizevars.var_to_val.get(value, None), SingletonInt
+                ):
+                    continue
+                if isinstance(value, sympy.Expr):  # Don't need to add symbolic
+                    add_expr_input(name, V.graph.sizevars.size_hint(value, fallback=42))
+                else:
+                    shape = [
+                        V.graph.sizevars.size_hint(x, fallback=42)
+                        for x in value.get_size()
+                    ]
+                    stride = [
+                        V.graph.sizevars.size_hint(x, fallback=42)
+                        for x in value.get_stride()
+                    ]
+                    add_fake_input(
+                        name,
+                        shape,
+                        stride,
+                        value.get_device(),
+                        value.get_dtype(),
+                    )
+
+            call_str = f"repro_run({', '.join(V.graph.graph_inputs.keys())})"
+            output.writeline(f"fn = lambda: {call_str}")
+            output.writeline("return fn()")
+
+    def write_prefix(self) -> None:
+        super().write_prefix()
+        if torch_npu.npu.aclnn._use_static_aclnn_kernel:
+            self.prefix.do_indent()
+            with self.prefix.indent():
+                self.prefix.writeline('global has_initialized')
+                self.prefix.writeline('if not has_initialized:')
+            self.prefix.do_indent()
+            with self.prefix.indent():
+                self.prefix.writeline('from torch_npu._inductor.npu_static_kernel import StaticKernelCompiler')
+                self.prefix.writeline('static_kernel_compiler = StaticKernelCompiler()')
+                self.prefix.writeline('static_kernel_compiler.__enter__()')
+                self.prefix.writeline('has_initialized = True')
+            self.prefix.do_indent()
+
+    def generate_return(self, output_refs: list[str]) -> None:
+        if torch_npu.npu.aclnn._use_static_aclnn_kernel:
+            self.wrapper_call.do_unindent()
+            with self.wrapper_call.indent():
+                self.wrapper_call.writeline('if not has_initialized:')
+            self.wrapper_call.do_indent()
+            with self.wrapper_call.indent():
+                self.wrapper_call.writeline('exc_info=(None, None, None)')
+                self.wrapper_call.writeline('static_kernel_compiler.__exit__(*exc_info)')
+        super().generate_return(output_refs)
+
+class NPUSubgraphWrapperCodegen(_NPUKernelCodegenMixin, SubgraphPythonWrapperCodegen):
+    """
+    Partition subgraph wrapper for NPU.
+
+    Inherits NPU kernel codegen specializations (define_kernel, numel_expr,
+    make_buffer_free, codegen_input_size_asserts) via _NPUKernelCodegenMixin,
+    so user Triton kernels inside a partition subgraph get the NPU-flavored
+    user_autotune_npu / FixedGridNpu rewrite instead of the upstream default.
+
+    Also overrides get_next_kernel_suffix to delegate to parent_wrapper,
+    matching the upstream next_kernel_suffix strategy - otherwise the
+    "peek" counter in the subgraph would diverge from the "consume" counter
+    (which upstream already delegates to parent), producing mismatched
+    kernel names between the kernel body placeholders and the real registered
+    function name.
+    """
+
+    def get_next_kernel_suffix(self) -> str:
+        return self.parent_wrapper.get_next_kernel_suffix()
